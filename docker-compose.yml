@@ -1,0 +1,796 @@
+x-common-env: &common-env
+  PUID: ${PUID}
+  PGID: ${PGID}
+  TZ: ${TZ}
+
+x-dns: &dns
+  - 172.19.0.53
+  - 1.1.1.1
+
+volumes:
+  rtorrent_data:
+
+services:
+
+  speedtest:
+    image: openspeedtest/latest
+    dns: *dns
+    restart: unless-stopped
+    environment: *common-env
+    container_name: openspeedtest
+    expose: ["3000"]
+    networks: [backend]
+
+  cloudflare:
+    image: oznu/cloudflare-ddns:latest
+    dns: *dns
+    container_name: cloudflare
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      API_KEY: ${CLOUDFLARE_TOKEN}
+      ZONE: example.com
+      PROXIED: "false"
+      RRTYPE: A
+    networks: [backend]
+
+  samba:
+    image: dperson/samba
+    dns: *dns
+    container_name: samba
+    command: '-u "pi;${SMB_PASS}" -s "media;/media;yes;no;no;pi" -g "force user = pi" -g "force group = pi"'
+    environment: *common-env
+    ports:
+      - "${LAN_IP}:139:139"
+      - "${LAN_IP}:445:445"
+    volumes:
+      - /media/media:/media
+    restart: unless-stopped
+    networks: [backend]
+
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    dns: *dns
+    container_name: jellyfin
+    environment:
+      <<: *common-env
+      JELLYFIN_PublishedServerUrl: ${JELLYFIN_EXTERNAL_URL}
+    depends_on: [samba]
+    volumes:
+      - /mnt/nvme/jellyfin/config:/config
+      - /mnt/nvme/jellyfin/cache:/config/cache
+      - /mnt/nvme/jellyfin/data:/config/data/data
+      - /mnt/nvme/jellyfin/metadata:/config/data/metadata
+      - /mnt/nvme/jellyfin/transcodes:/config/data/transcodes
+      - /media/media:/data/media
+    expose: ["8096"]
+    ports:
+      - "8096:8096"
+    restart: unless-stopped
+    networks: [backend]
+
+  meilisearch:
+    image: getmeili/meilisearch:latest
+    dns: *dns
+    container_name: meilisearch
+    environment:
+      MEILI_ENV: production
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - /mnt/nvme/meilisearch:/meili_data
+    expose: ["7700"]
+    restart: unless-stopped
+    networks: [backend]
+
+  pixelfin:
+    image: ghcr.io/nothing2obvi/pixelfin:latest
+    dns: *dns
+    container_name: pixelfin
+    environment: *common-env
+    depends_on: [jellyfin]
+    volumes:
+      - /mnt/nvme/pixelfin/data:/app/data
+      - /mnt/nvme/pixelfin/output:/app/output
+      - /mnt/nvme/pixelfin/assets:/app/assets
+    expose: ["1280"]
+    restart: unless-stopped
+    networks: [backend]
+
+  portainer:
+    image: portainer/portainer-ce:2.39.4-alpine
+    dns: *dns
+    container_name: portainer
+    expose: ["9000"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /mnt/nvme/portainer:/data
+    restart: always
+    networks: [backend]
+
+  pihole:
+    image: pihole/pihole:latest
+    container_name: pihole
+    environment:
+      TZ: ${TZ}
+      FTLCONF_webserver_api_password: ${PIHOLE_PASS}
+      FTLCONF_dns_listeningMode: all
+    volumes:
+      - /mnt/nvme/pihole:/etc/pihole
+    expose: ["53", "80", "443"]
+    ports:
+      - "53:53/tcp"
+      - "53:53/udp"
+    cap_add:
+      - SYS_NICE
+      - SYS_TIME
+    restart: unless-stopped
+    networks:
+      backend:
+        ipv4_address: 172.19.0.53
+
+  nginx:
+    container_name: nginx
+    image: nginx:stable
+    dns: *dns
+    environment: *common-env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./certbot/www:/var/www/certbot
+      - ./certbot/conf:/etc/letsencrypt
+    depends_on:
+      - certbot
+      - portainer
+      - jellyfin
+      - meilisearch
+      - pixelfin
+      - pihole
+      - rutorrent
+      - flood
+      - navidrome
+      - byparr
+      - recommendarr
+      - prowlarr
+      - radarr
+      - bazarr
+      - sonarr
+      - jellyseerr
+      - lingarr
+      - maintainerr
+      - streamystats
+      - lidarr
+      - digarr
+      - whisparr
+      - muxarr
+      - bookshelf
+      - dashdot
+      - metube
+      - calibre
+      - watchtower
+      - amule
+      - amulerr
+      - openclaw
+      - syncthing
+      - questarr
+      - profilarr
+      - cleanuparr
+    command:
+      - /bin/sh
+      - -c
+      - |
+        ( while :; do
+            if [ -f /var/www/certbot/.nginx-reload ]; then
+              rm -f /var/www/certbot/.nginx-reload
+              nginx -s reload 2>/dev/null || true
+            fi
+            sleep 60
+          done ) &
+        sleep 60
+        exec nginx -g 'daemon off;'
+    restart: unless-stopped
+    networks: [backend, openclaw_net]
+
+  certbot:
+    container_name: certbot
+    image: certbot/certbot
+    dns: *dns
+    environment: *common-env
+    volumes:
+      - ./certbot/www:/var/www/certbot
+      - ./certbot/conf:/etc/letsencrypt
+    entrypoint: /bin/sh -c
+    command: >
+      "trap exit TERM; while :; do sleep 3600; done"
+    restart: unless-stopped
+    networks: [backend]
+
+  certbot-renew:
+    container_name: certbot_renew
+    image: certbot/certbot
+    dns: *dns
+    environment: *common-env
+    depends_on:
+      - certbot
+      - nginx
+    volumes:
+      - ./certbot/www:/var/www/certbot
+      - ./certbot/conf:/etc/letsencrypt
+    entrypoint: /bin/sh -c
+    command: >
+      "while :; do
+         certbot renew --webroot -w /var/www/certbot --deploy-hook 'touch /var/www/certbot/.nginx-reload';
+         sleep 43200;
+       done"
+    restart: always
+    networks: [backend]
+
+  rutorrent:
+    image: crazymax/rtorrent-rutorrent:latest
+    dns: *dns
+    container_name: rutorrent
+    environment:
+      <<: *common-env
+      RT_INC_PORT: 51413
+      RT_DHT_PORT: 6881
+    volumes:
+      - /mnt/nvme/rtorrent-rutorrent/data:/data
+      - /mnt/nvme/rtorrent-rutorrent/passwd:/passwd
+      - /media/downloads:/downloads
+      - /media/watch:/data/rtorrent/watch
+      - rtorrent_data:/var/run/rtorrent
+    expose:
+      - "8080"
+      - "8000"
+    ports:
+      - "51413:51413"
+      - "6881:6881/udp"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks: [backend]
+
+  flood:
+    image: jesec/flood:latest
+    dns: *dns
+    container_name: flood
+    hostname: flood
+    user: "${PUID}:${PGID}"
+    environment:
+      HOME: /config
+    depends_on:
+      rutorrent:
+        condition: service_healthy
+    volumes:
+      - /mnt/nvme/flood/config:/config
+      - /media/downloads:/data
+      - rtorrent_data:/var/run/rtorrent
+    command: --host 0.0.0.0 --port 3001 --allowedpath /data
+    expose:
+      - "3001"
+    restart: unless-stopped
+    networks: [backend]
+
+  navidrome:
+    image: deluan/navidrome:latest
+    dns: *dns
+    container_name: navidrome
+    environment:
+      <<: *common-env
+      ND_LOGLEVEL: info
+      ND_SCANSCHEDULE: 720h
+    volumes:
+      - /mnt/nvme/navidrome/data:/data
+      - /media/media/Music:/music:ro
+    expose: ["4533"]
+    restart: unless-stopped
+    networks: [backend]
+
+  byparr:
+    image: ghcr.io/thephaseless/byparr:latest
+    dns: *dns
+    container_name: byparr
+    environment:
+      <<: *common-env
+      HOST: 0.0.0.0
+    expose: ["8191"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8191/docs"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks: [backend]
+
+  recommendarr:
+    image: tannermiddleton/recommendarr:latest
+    dns: *dns
+    container_name: recommendarr
+    environment:
+      <<: *common-env
+      PUBLIC_URL: http://recommendarr.local
+    volumes:
+      - /mnt/nvme/recommendarr:/app/server/data
+    expose: ["3000"]
+    restart: unless-stopped
+    networks: [backend]
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    dns: *dns
+    container_name: prowlarr
+    environment:
+      <<: *common-env
+      USER: ${PROWLARR_USER}
+      PASS: ${PROWLARR_PASS}
+    volumes:
+      - /mnt/nvme/prowlarr/config:/config
+    expose: ["9696"]
+    restart: unless-stopped
+    networks: [backend]
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    dns: *dns
+    container_name: radarr
+    environment: *common-env
+    volumes:
+      - /mnt/nvme/radarr/config:/config
+      - /media/downloads:/downloads
+      - /media/media/Movies:/movies
+    expose: ["7878"]
+    restart: unless-stopped
+    networks: [backend]
+
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    dns: *dns
+    container_name: bazarr
+    environment: *common-env
+    volumes:
+      - /mnt/nvme/bazarr/config:/config
+      - /media/media/Movies:/movies
+      - "/media/media/Tv Series:/tv"
+    expose: ["6767"]
+    restart: unless-stopped
+    networks: [backend]
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    dns: *dns
+    container_name: sonarr
+    environment: *common-env
+    volumes:
+      - /mnt/nvme/sonarr/config:/config
+      - /media/downloads:/downloads
+      - "/media/media/Tv Series:/tv"
+    expose: ["8989"]
+    restart: unless-stopped
+    networks: [backend]
+
+  jellyseerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    dns: *dns
+    init: true
+    container_name: jellyseerr
+    environment:
+      <<: *common-env
+      LOG_LEVEL: info
+    volumes:
+      - /mnt/nvme/jellyseerr/config:/app/config
+    expose: ["5055"]
+    restart: unless-stopped
+    networks: [backend]
+
+  maintainerr:
+    image: ghcr.io/maintainerr/maintainerr:latest
+    dns: *dns
+    container_name: maintainerr
+    environment: *common-env
+    volumes:
+      - /mnt/nvme/maintainerr/data:/opt/data
+    expose: ["6246"]
+    restart: unless-stopped
+    networks: [backend]
+
+  streamystats:
+    image: ghcr.io/fredrikburmester/streamystats-nextjs:latest
+    dns: *dns
+    container_name: streamystats
+    environment:
+      NODE_ENV: production
+      TZ: ${TZ}
+      DATABASE_URL: postgresql://postgres:${SS_POSTGRES_PASSWORD}@streamystats-db:5432/streamystats
+      JOB_SERVER_URL: http://streamystats-job:3005
+      HOSTNAME: 0.0.0.0
+      SESSION_SECRET: ${SS_SESSION_SECRET}
+      NEXT_SERVER_ACTIONS_ENCRYPTION_KEY: ${SS_ENCRYPTION_KEY}
+    depends_on:
+      streamystats-db:
+        condition: service_healthy
+      streamystats-job:
+        condition: service_started
+    expose: ["3000"]
+    restart: unless-stopped
+    networks: [backend]
+
+  streamystats-job:
+    image: ghcr.io/fredrikburmester/streamystats-job-server:latest
+    dns: *dns
+    container_name: streamystats-job
+    environment:
+      NODE_ENV: production
+      TZ: ${TZ}
+      DATABASE_URL: postgresql://postgres:${SS_POSTGRES_PASSWORD}@streamystats-db:5432/streamystats
+      PORT: 3005
+      HOST: 0.0.0.0
+    depends_on:
+      streamystats-db:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [backend]
+
+  streamystats-db:
+    image: tensorchord/vchord-postgres:pg18-v1.1.1
+    dns: *dns
+    container_name: streamystats-db
+    user: "1000:1000"
+    group_add: ["999"]
+    command: ["postgres", "-c", "log_checkpoints=off"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${SS_POSTGRES_PASSWORD}
+      POSTGRES_DB: streamystats
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    volumes:
+      - /mnt/nvme/streamystats/db:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d streamystats"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks: [backend]
+
+  lingarr:
+    image: lingarr/lingarr:latest
+    dns: *dns
+    container_name: lingarr
+    restart: unless-stopped
+    environment:
+      - ASPNETCORE_URLS=http://+:9876
+    expose: ["9876"]
+    volumes:
+      - /media/media/Movies:/movies
+      - "/media/media/Tv Series:/tv"
+      - /mnt/nvme/lingarr:/app/config
+    networks: [backend]
+
+  lidarr:
+    image: lscr.io/linuxserver/lidarr:latest
+    dns: *dns
+    container_name: lidarr
+    environment: *common-env
+    volumes:
+      - /mnt/nvme/lidarr/config:/config
+      - /media/downloads:/downloads
+      - /media/media/Music:/music
+    expose: ["8686"]
+    restart: unless-stopped
+    networks: [backend]
+
+  digarr:
+    image: docker.io/iuliandita/digarr:debian
+    dns: *dns
+    container_name: digarr
+    environment:
+      <<: *common-env
+      ALLOWED_ORIGIN: http://digarr.local
+      DIGARR_ENCRYPTION_KEY: ${DIGARR_ENCRYPTION_KEY}
+      LIDARR_URL: http://lidarr:8686
+      LIDARR_API_KEY: ${LIDARR_API_KEY}
+      AI_PROVIDER: openai
+      AI_MODEL: gpt-4o-mini
+      AI_API_KEY: ${AI_API_KEY}
+    volumes:
+      - /mnt/nvme/digarr/data:/app/data
+      - /mnt/nvme/digarr/backups:/app/backups
+    expose: ["3000"]
+    restart: unless-stopped
+    networks: [backend]
+
+  whisparr:
+    image: ghcr.io/thespad/whisparr:latest
+    dns: *dns
+    container_name: whisparr
+    environment: *common-env
+    volumes:
+      - /mnt/nvme/whisparr/config:/config
+      - /media/downloads:/downloads
+      - /media/media/XXX:/xxx
+    expose: ["6969"]
+    restart: unless-stopped
+    networks: [backend]
+
+  muxarr:
+    image: ghcr.io/kirovair/muxarr:latest
+    dns: *dns
+    container_name: muxarr
+    environment: *common-env
+    volumes:
+      - /mnt/nvme/muxarr:/data
+      - /media/media/Movies:/movies
+      - "/media/media/Tv Series:/tv"
+      - /media/media/XXX:/xxx
+    expose: ["8183"]
+    restart: unless-stopped
+    networks: [backend]
+
+  bookshelf:
+    image: ghcr.io/pennydreadful/bookshelf:hardcover
+    dns: *dns
+    container_name: bookshelf
+    environment: *common-env
+    volumes:
+      - /mnt/nvme/bookshelf/config:/config
+      - /media/downloads:/downloads
+      - /media/media/Books:/books
+    expose: ["8787"]
+    restart: unless-stopped
+    networks: [backend]
+
+  questarr:
+    # Imagen construida localmente para ARM64 (upstream solo publica amd64).
+    # Base cambiada a node:24-alpine. Fuente en /mnt/nvme/questarr/src
+    # Reconstruir: docker build --platform linux/arm64 -t questarr:local /mnt/nvme/questarr/src
+    image: questarr:local
+    dns: *dns
+    container_name: questarr
+    environment:
+      <<: *common-env
+      SQLITE_DB_PATH: /app/data/sqlite.db
+    volumes:
+      - /mnt/nvme/questarr/data:/app/data
+      - /media/downloads:/downloads
+    expose: ["5000"]
+    restart: unless-stopped
+    networks: [backend]
+
+  dashdot:
+    image: mauricenino/dashdot:latest
+    dns: *dns
+    container_name: dashdot
+    expose: ["3001"]
+    environment:
+      DASHDOT_ENABLE_CPU_TEMPS: "true"
+      DASHDOT_ENABLE_STORAGE: "true"
+      DASHDOT_ENABLE_NETWORK: "true"
+      DASHDOT_PORT: 3001
+      DASHDOT_SHOW_HOST: "true"
+    volumes:
+      - /:/mnt/host:ro
+    restart: unless-stopped
+    networks: [backend]
+
+  metube:
+    image: ghcr.io/alexta69/metube
+    dns: *dns
+    environment:
+      <<: *common-env
+    container_name: metube
+    restart: unless-stopped
+    expose: ["8081"]
+    volumes:
+      - /media/media/Youtube:/downloads
+    networks: [backend]
+
+  calibre:
+    image: lscr.io/linuxserver/calibre-web:latest
+    dns: *dns
+    container_name: calibre
+    environment:
+      <<: *common-env
+    volumes:
+      - /mnt/nvme/calibre:/config
+      - /media/media/Books:/books
+    expose: ["8083"]
+    restart: unless-stopped
+    networks: [backend]
+
+  profilarr:
+    image: ghcr.io/dictionarry-hub/profilarr:latest
+    dns: *dns
+    container_name: profilarr
+    environment:
+      <<: *common-env
+      PARSER_HOST: profilarr-parser
+      PARSER_PORT: 5000
+      ORIGIN: http://profilarr.local
+    volumes:
+      - /mnt/nvme/profilarr/config:/config
+    depends_on:
+      - profilarr-parser
+    expose: ["6868"]
+    restart: unless-stopped
+    networks: [backend]
+
+  profilarr-parser:
+    image: ghcr.io/dictionarry-hub/profilarr-parser:latest
+    dns: *dns
+    container_name: profilarr-parser
+    environment: *common-env
+    expose: ["5000"]
+    restart: unless-stopped
+    networks: [backend]
+
+  cleanuparr:
+    image: ghcr.io/cleanuparr/cleanuparr:latest
+    dns: *dns
+    container_name: cleanuparr
+    environment:
+      <<: *common-env
+      PORT: 11011
+    volumes:
+      - /mnt/nvme/cleanuparr/config:/config
+    expose: ["11011"]
+    restart: unless-stopped
+    networks: [backend]
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    dns: *dns
+    container_name: watchtower
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_LABEL_ENABLE: "false"
+      WATCHTOWER_SCHEDULE: "0 0 10 * * *"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [backend]
+
+  sabnzbd:
+    image: lscr.io/linuxserver/sabnzbd:latest
+    dns: *dns
+    container_name: sabnzbd
+    environment: *common-env
+    volumes:
+      - /mnt/nvme/sabnzbd/config:/config
+      - /media/downloads:/downloads
+    expose: ["8080"]
+    restart: unless-stopped
+    networks: [backend]
+
+  amule:
+    image: ngosang/amule:latest
+    dns: *dns
+    container_name: amule
+    environment:
+      <<: *common-env
+      GUI_PWD: ${GUI_PWD}
+      WEBUI_PWD: ${WEBUI_PWD}
+      MOD_AUTO_RESTART_ENABLED: "true"
+      MOD_AUTO_RESTART_CRON: "0 6 * * *"
+      MOD_AUTO_SHARE_ENABLED: "true"
+      MOD_AUTO_SHARE_DIRECTORIES: "/home/amule/.aMule/Incoming"
+    volumes:
+      - /mnt/nvme/amule/config:/home/amule/.aMule
+      - /media/downloads:/downloads
+    expose: ["4711"]
+    ports:
+      - "4662:4662/tcp"
+      - "4672:4672/udp"
+      - "4665:4665/udp"
+    restart: unless-stopped
+    networks: [backend]
+
+  amulerr:
+    image: isc30/amulerr:latest
+    dns: *dns
+    container_name: amulerr
+    user: "${PUID}:${PGID}"
+    environment:
+      TZ: ${TZ}
+      AMULE_HOST: amule
+      AMULE_PORT: 4712
+      AMULE_PWD: ${GUI_PWD}
+    depends_on:
+      - amule
+    expose: ["3000"]
+    restart: unless-stopped
+    networks: [backend]
+
+  syncthing:
+    image: syncthing/syncthing:latest
+    dns: *dns
+    container_name: syncthing
+    environment:
+      <<: *common-env
+      STGUIADDRESS: "0.0.0.0:8384"
+    volumes:
+      - /mnt/nvme/syncthing:/var/syncthing
+    restart: unless-stopped
+    networks: [backend]
+
+  openclaw:
+    image: ${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:latest}
+    container_name: openclaw
+    expose: ["18789"]
+    environment:
+      <<: *common-env
+      OPENCLAW_DISABLE_BONJOUR: "1"
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+    volumes:
+      - /mnt/nvme/openclaw/config:/home/node/.openclaw
+      - /mnt/nvme/openclaw/secrets:/home/node/.config/openclaw
+      - /media/media:/home/node/media:ro
+    command: ["node", "openclaw.mjs", "gateway", "--bind", "lan"]
+    cap_drop:
+      - NET_RAW
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:18789/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+    networks: [openclaw_net]
+
+  openclaw-cli:
+    image: ${OPENCLAW_IMAGE:-ghcr.io/openclaw/openclaw:latest}
+    profiles: ["cli"]
+    network_mode: "service:openclaw"
+    environment:
+      <<: *common-env
+      BROWSER: echo
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+    volumes:
+      - /mnt/nvme/openclaw/config:/home/node/.openclaw
+      - /mnt/nvme/openclaw/secrets:/home/node/.config/openclaw
+      - /media/media:/home/node/media:ro
+    entrypoint: ["node", "dist/index.js"]
+    stdin_open: true
+    tty: true
+
+  managarr:
+    image: darkalex17/managarr:latest
+    dns: *dns
+    container_name: managarr
+    profiles: ["cli"]
+    environment: *common-env
+    volumes:
+      - /mnt/nvme/managarr/config.yml:/root/.config/managarr/config.yml
+    stdin_open: true
+    tty: true
+    networks: [backend]
+
+  opencode:
+    image: openeuler/opencode:latest
+    container_name: opencode
+    profiles: ["cli"]
+    network_mode: "host"
+    volumes:
+      - ${HOME}/.config/opencode:${HOME}/.config/opencode
+      - ${PWD}:/workspace
+    working_dir: /workspace/opencode
+    stdin_open: true
+    tty: true
+    entrypoint: ["opencode"]
+
+networks:
+  backend:
+    ipam:
+      config:
+        - subnet: 172.19.0.0/16
+  openclaw_net:

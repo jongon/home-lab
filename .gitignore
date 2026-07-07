@@ -1,0 +1,22 @@
+# Secretos y entorno — NUNCA subir
+.env
+.env.*
+!.env.example
+
+# Certificados TLS / Let's Encrypt
+certbot/
+*.pem
+*.key
+*.crt
+
+# Datos de contenedores / volúmenes locales
+data/
+config/
+*.db
+*.sqlite
+*.sqlite3
+
+# Sistema
+.DS_Store
+Thumbs.db
+*.log
